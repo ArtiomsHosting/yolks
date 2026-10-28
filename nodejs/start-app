@@ -1,0 +1,91 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly READY_MESSAGE='[System] App starting'
+
+log() {
+    printf '\033[1m\033[36m[System]\033[0m %s\n' "$1"
+}
+
+fail() {
+    printf '\033[1m\033[31m[System]\033[0m %s\n' "$1"
+    exit 1
+}
+
+is_enabled() {
+    [[ "${1:-0}" == "1" || "${1:-}" == "true" ]]
+}
+
+git_with_credentials() {
+    if [[ -z "${GIT_TOKEN:-}" ]]; then
+        git "$@"
+        return
+    fi
+
+    git -c credential.helper= \
+        -c credential.helper='!f() { echo "username=${GIT_USERNAME:-x-access-token}"; echo "password=${GIT_TOKEN}"; }; f' \
+        "$@"
+}
+
+update_repository() {
+    if ! is_enabled "${AUTO_UPDATE:-0}" || [[ ! -d .git ]]; then
+        return
+    fi
+
+    log 'Pulling the latest changes'
+    if ! git_with_credentials pull --ff-only; then
+        log 'Could not pull the latest changes, starting with the current files'
+    fi
+}
+
+package_manager() {
+    local selected="${PACKAGE_MANAGER:-auto}"
+
+    if [[ "$selected" != 'auto' ]]; then
+        printf '%s' "$selected"
+    elif [[ -f pnpm-lock.yaml ]]; then
+        printf 'pnpm'
+    elif [[ -f yarn.lock ]]; then
+        printf 'yarn'
+    else
+        printf 'npm'
+    fi
+}
+
+install_dependencies() {
+    if ! is_enabled "${INSTALL_DEPS:-1}" || [[ ! -f package.json ]]; then
+        return
+    fi
+
+    local manager
+    manager="$(package_manager)"
+    log "Installing dependencies with ${manager}"
+
+    case "$manager" in
+        npm) npm install --no-audit ;;
+        pnpm) if [[ -f pnpm-lock.yaml ]]; then pnpm install --frozen-lockfile; else pnpm install; fi ;;
+        yarn) if [[ -f yarn.lock ]]; then yarn install --frozen-lockfile; else yarn install; fi ;;
+        *) fail "Unknown package manager: ${manager}" ;;
+    esac || fail 'Installing dependencies failed'
+}
+
+start_app() {
+    if [[ -n "${START_COMMAND:-}" ]]; then
+        printf '%s\n' "$READY_MESSAGE"
+        exec /bin/bash -c "$START_COMMAND"
+    fi
+
+    local main_file="${MAIN_FILE:-index.js}"
+    [[ -f "$main_file" ]] || fail "Main file ${main_file} was not found"
+
+    local -a node_args=()
+    read -r -a node_args <<< "${NODE_ARGS:-}"
+
+    printf '%s\n' "$READY_MESSAGE"
+    exec node "${node_args[@]}" "$main_file"
+}
+
+cd /home/container
+update_repository
+install_dependencies
+start_app
