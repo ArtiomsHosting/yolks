@@ -7,6 +7,7 @@ run scripts and apps. Each image is built for `linux/amd64` and `linux/arm64` an
 | Image | Base | Includes |
 | --- | --- | --- |
 | `ghcr.io/artiomshosting/yolks:nodejs_26` | `node:26-trixie-slim` | Node.js 26, npm, pnpm 12, Yarn 1, git, curl, tini, build tools for native modules |
+| `ghcr.io/artiomshosting/yolks:installer_debian` | `debian:trixie-slim` | For egg install scripts: runs as root with git, curl, jq, tar, unzip, xz |
 
 Every image also gets a dated tag (`nodejs_26-20261028`) so a server can be pinned to a known build.
 
