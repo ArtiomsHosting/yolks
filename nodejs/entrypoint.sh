@@ -11,9 +11,6 @@ export INTERNAL_IP
 
 cd /home/container
 
-prompt 'node -v'
-node -v
-
 if [[ -z "${STARTUP:-}" ]]; then
     printf 'No startup command was provided.\n' >&2
     exit 1
