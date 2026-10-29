@@ -2,6 +2,7 @@ FROM node:26-trixie-slim
 
 ARG PNPM_VERSION=12.16.1
 ARG YARN_VERSION=1.22.22
+ARG COREPACK_VERSION=0.36.0
 
 LABEL org.opencontainers.image.title="Node.js 26"
 LABEL org.opencontainers.image.description="Node.js 26 runtime for Pterodactyl and Pelican servers"
@@ -21,6 +22,8 @@ RUN apt-get update \
         tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --global "pnpm@${PNPM_VERSION}" "yarn@${YARN_VERSION}" \
+    && npm install --prefix /opt/corepack "corepack@${COREPACK_VERSION}" \
+    && ln -s /opt/corepack/node_modules/.bin/corepack /usr/local/bin/corepack \
     && npm cache clean --force \
     && useradd --create-home --home-dir /home/container --shell /bin/bash container
 
@@ -31,7 +34,10 @@ USER container
 ENV USER=container \
     HOME=/home/container \
     NPM_CONFIG_UPDATE_NOTIFIER=false \
-    NPM_CONFIG_FUND=false
+    NPM_CONFIG_FUND=false \
+    pnpm_config_dangerously_allow_all_builds=true \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    COREPACK_ENABLE_AUTO_PIN=0
 WORKDIR /home/container
 
 ENTRYPOINT ["/usr/bin/tini", "-g", "--"]

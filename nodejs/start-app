@@ -2,6 +2,10 @@
 set -euo pipefail
 
 readonly READY_MESSAGE='[System] App starting'
+readonly DEPENDENCY_STAMP='node_modules/.dependencies-hash'
+readonly HEAP_PERCENT=75
+
+PACKAGE_MANAGER_COMMAND=()
 
 log() {
     printf '\033[1m\033[36m[System]\033[0m %s\n' "$1"
@@ -38,18 +42,77 @@ update_repository() {
     fi
 }
 
-package_manager() {
-    local selected="${PACKAGE_MANAGER:-auto}"
+package_field() {
+    [[ -f package.json ]] || return 0
 
-    if [[ "$selected" != 'auto' ]]; then
-        printf '%s' "$selected"
-    elif [[ -f pnpm-lock.yaml ]]; then
-        printf 'pnpm'
-    elif [[ -f yarn.lock ]]; then
-        printf 'yarn'
-    else
-        printf 'npm'
+    node -e '
+        const value = process.argv[1].split(".").reduce(
+            (object, key) => (object == null ? undefined : object[key]),
+            JSON.parse(require("node:fs").readFileSync("package.json", "utf8")),
+        );
+        if (typeof value === "string") process.stdout.write(value);
+    ' "$1" 2>/dev/null || true
+}
+
+select_package_manager() {
+    local selected="${PACKAGE_MANAGER:-auto}"
+    local declared
+    declared="$(package_field packageManager)"
+    local declared_name="${declared%%@*}"
+
+    if [[ "$selected" == 'auto' ]]; then
+        if [[ -n "$declared_name" ]]; then
+            selected="$declared_name"
+        elif [[ -f pnpm-lock.yaml ]]; then
+            selected='pnpm'
+        elif [[ -f yarn.lock ]]; then
+            selected='yarn'
+        else
+            selected='npm'
+        fi
     fi
+
+    case "$selected" in
+        npm) PACKAGE_MANAGER_COMMAND=(npm) ;;
+        pnpm | yarn)
+            if [[ "$declared_name" == "$selected" ]]; then
+                PACKAGE_MANAGER_COMMAND=(corepack "$selected")
+            else
+                PACKAGE_MANAGER_COMMAND=("$selected")
+            fi
+            ;;
+        *) fail "Unknown package manager: ${selected}" ;;
+    esac
+}
+
+dependencies_hash() {
+    {
+        printf 'node %s\n' "$(node -p 'process.versions.node.split(".")[0]')"
+        printf 'manager %s\n' "${PACKAGE_MANAGER_COMMAND[*]}"
+        cat package.json
+        local lockfile
+        for lockfile in package-lock.json npm-shrinkwrap.json pnpm-lock.yaml yarn.lock; do
+            if [[ -f "$lockfile" ]]; then
+                cat "$lockfile"
+            fi
+        done
+    } | sha256sum | cut -d ' ' -f 1
+}
+
+run_install() {
+    local -a command=("${PACKAGE_MANAGER_COMMAND[@]}" install)
+    local via_corepack=false
+    if [[ "${PACKAGE_MANAGER_COMMAND[0]}" == 'corepack' ]]; then
+        via_corepack=true
+    fi
+
+    case "${PACKAGE_MANAGER_COMMAND[-1]}" in
+        npm) command+=(--no-audit) ;;
+        pnpm) if [[ -f pnpm-lock.yaml ]]; then command+=(--frozen-lockfile); fi ;;
+        yarn) if [[ "$via_corepack" == false && -f yarn.lock ]]; then command+=(--frozen-lockfile); fi ;;
+    esac
+
+    env -u NODE_ENV "${command[@]}"
 }
 
 install_dependencies() {
@@ -57,16 +120,63 @@ install_dependencies() {
         return
     fi
 
-    local manager
-    manager="$(package_manager)"
-    log "Installing dependencies with ${manager}"
+    if [[ -d node_modules && -f "$DEPENDENCY_STAMP" && "$(cat "$DEPENDENCY_STAMP")" == "$(dependencies_hash)" ]]; then
+        log 'Dependencies are up to date, delete node_modules to force a clean install'
+        return
+    fi
 
-    case "$manager" in
-        npm) npm install --no-audit ;;
-        pnpm) if [[ -f pnpm-lock.yaml ]]; then pnpm install --frozen-lockfile; else pnpm install; fi ;;
-        yarn) if [[ -f yarn.lock ]]; then yarn install --frozen-lockfile; else yarn install; fi ;;
-        *) fail "Unknown package manager: ${manager}" ;;
-    esac || fail 'Installing dependencies failed'
+    log "Installing dependencies with ${PACKAGE_MANAGER_COMMAND[*]}"
+    run_install || fail 'Installing dependencies failed'
+
+    mkdir -p node_modules
+    dependencies_hash > "$DEPENDENCY_STAMP"
+}
+
+env_file_keys() {
+    [[ -f .env ]] || return 0
+
+    node -e '
+        const { parseEnv } = require("node:util");
+        const keys = Object.keys(parseEnv(require("node:fs").readFileSync(".env", "utf8")));
+        process.stdout.write(keys.join("\n"));
+    ' 2>/dev/null || true
+}
+
+export_defaults() {
+    local env_keys
+    env_keys="$(env_file_keys)"
+
+    local entry key value
+    for entry in "PORT=${SERVER_PORT:-}" 'HOST=0.0.0.0' 'NODE_ENV=production'; do
+        key="${entry%%=*}"
+        value="${entry#*=}"
+        if [[ -z "$value" || -n "${!key:-}" ]] || grep -qxF "$key" <<< "$env_keys"; then
+            continue
+        fi
+        printf -v "$key" '%s' "$value"
+        export "${key?}"
+    done
+}
+
+limit_heap() {
+    local memory="${SERVER_MEMORY:-0}"
+
+    if [[ ! "$memory" =~ ^[0-9]+$ ]] || (( memory == 0 )); then
+        return
+    fi
+    if [[ "${NODE_OPTIONS:-} ${NODE_ARGS:-}" == *max-old-space-size* ]]; then
+        return
+    fi
+
+    export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--max-old-space-size=$(( memory * HEAP_PERCENT / 100 ))"
+}
+
+start_node() {
+    local -a node_args=()
+    read -r -a node_args <<< "${NODE_ARGS:-}"
+
+    printf '%s\n' "$READY_MESSAGE"
+    exec node "${node_args[@]}" "$1"
 }
 
 start_app() {
@@ -75,17 +185,36 @@ start_app() {
         exec /bin/bash -c "$START_COMMAND"
     fi
 
-    local main_file="${MAIN_FILE:-index.js}"
-    [[ -f "$main_file" ]] || fail "Main file ${main_file} was not found"
+    if [[ -n "${MAIN_FILE:-}" ]]; then
+        [[ -f "$MAIN_FILE" ]] || fail "Main file ${MAIN_FILE} was not found"
+        start_node "$MAIN_FILE"
+    fi
 
-    local -a node_args=()
-    read -r -a node_args <<< "${NODE_ARGS:-}"
+    if [[ -n "$(package_field scripts.start)" ]]; then
+        printf '%s\n' "$READY_MESSAGE"
+        exec "${PACKAGE_MANAGER_COMMAND[@]}" start
+    fi
 
-    printf '%s\n' "$READY_MESSAGE"
-    exec node "${node_args[@]}" "$main_file"
+    local main
+    main="$(package_field main)"
+    if [[ -n "$main" && -f "$main" ]]; then
+        start_node "$main"
+    fi
+
+    local candidate
+    for candidate in index.js index.mjs index.cjs index.ts; do
+        if [[ -f "$candidate" ]]; then
+            start_node "$candidate"
+        fi
+    done
+
+    fail 'Nothing to start: set a main file or a start command, or add a "start" script to package.json'
 }
 
 cd /home/container
 update_repository
+select_package_manager
 install_dependencies
+export_defaults
+limit_heap
 start_app
