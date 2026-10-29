@@ -171,9 +171,17 @@ limit_heap() {
     export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--max-old-space-size=$(( memory * HEAP_PERCENT / 100 ))"
 }
 
+supports_typescript() {
+    [[ "$(node -p 'Boolean(process.features.typescript)')" == true ]]
+}
+
 start_node() {
     local -a node_args=()
     read -r -a node_args <<< "${NODE_ARGS:-}"
+
+    if [[ "$1" == *.ts || "$1" == *.mts || "$1" == *.cts ]] && ! supports_typescript; then
+        fail "Node.js $(node -v) cannot run TypeScript files like $1: use Node.js 22 or newer, or compile it with a start command"
+    fi
 
     printf '%s\n' "$READY_MESSAGE"
     exec node "${node_args[@]}" "$1"

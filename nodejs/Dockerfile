@@ -1,11 +1,14 @@
-FROM node:26-trixie-slim
+ARG NODE_VERSION
 
+FROM node:${NODE_VERSION}-trixie-slim
+
+ARG NODE_VERSION
 ARG PNPM_VERSION=12.16.1
 ARG YARN_VERSION=1.22.22
 ARG COREPACK_VERSION=0.36.0
 
-LABEL org.opencontainers.image.title="Node.js 26"
-LABEL org.opencontainers.image.description="Node.js 26 runtime for Pterodactyl and Pelican servers"
+LABEL org.opencontainers.image.title="Node.js ${NODE_VERSION}"
+LABEL org.opencontainers.image.description="Node.js ${NODE_VERSION} runtime for Pterodactyl and Pelican servers"
 LABEL org.opencontainers.image.source="https://github.com/ArtiomsHosting/yolks"
 LABEL org.opencontainers.image.licenses="MIT"
 
@@ -21,9 +24,12 @@ RUN apt-get update \
         tini \
         tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install --global "pnpm@${PNPM_VERSION}" "yarn@${YARN_VERSION}" \
-    && npm install --prefix /opt/corepack "corepack@${COREPACK_VERSION}" \
-    && ln -s /opt/corepack/node_modules/.bin/corepack /usr/local/bin/corepack \
+    && npm install --global "pnpm@${PNPM_VERSION}" \
+    && if ! command -v yarn >/dev/null; then npm install --global "yarn@${YARN_VERSION}"; fi \
+    && if ! command -v corepack >/dev/null; then \
+        npm install --prefix /opt/corepack "corepack@${COREPACK_VERSION}" \
+        && ln -s /opt/corepack/node_modules/.bin/corepack /usr/local/bin/corepack; \
+    fi \
     && npm cache clean --force \
     && useradd --create-home --home-dir /home/container --shell /bin/bash container
 
