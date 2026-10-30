@@ -7,7 +7,10 @@ readonly READY_TIMEOUT_SECONDS=60
 readonly PID_FILE_STARTED_LINE=2
 readonly PID_FILE_STATUS_LINE=7
 readonly IDENTIFIER_PATTERN='^[a-z_][a-z0-9_]{0,62}$'
+readonly CERTIFICATE_DAYS=3650
+readonly CERTIFICATE_KEY_BITS=2048
 
+SSL_ENABLED=false
 POSTGRES_PID=''
 POSTGRES_LAUNCHED_AT=0
 CONSOLE_PID=''
@@ -94,6 +97,28 @@ prepare_data() {
     initialize_data
 }
 
+prepare_certificate() {
+    local certificate="${PGDATA}/server.crt"
+    local key="${PGDATA}/server.key"
+
+    if [[ -f "$certificate" && -f "$key" ]]; then
+        SSL_ENABLED=true
+        return
+    fi
+
+    if [[ -f "$certificate" || -f "$key" ]]; then
+        log 'Found only one of server.crt and server.key in postgres_db, starting without SSL. Add the missing file or delete the other to get a new self-signed certificate.'
+        return
+    fi
+
+    log 'Creating a self-signed SSL certificate'
+    openssl req -x509 -newkey "rsa:${CERTIFICATE_KEY_BITS}" -nodes -days "$CERTIFICATE_DAYS" \
+        -subj "/CN=${HOSTNAME}" -keyout "$key" -out "$certificate" 2>/dev/null \
+        || fail 'Creating the SSL certificate failed'
+    chmod 0600 "$key"
+    SSL_ENABLED=true
+}
+
 is_accepting_connections() {
     local -a lines
     mapfile -t lines < "${PGDATA}/postmaster.pid" 2>/dev/null || return 1
@@ -104,8 +129,13 @@ is_accepting_connections() {
 }
 
 start_server() {
+    local -a settings=(-c "port=${SERVER_PORT}" -c "listen_addresses=*" -c "unix_socket_directories=${SOCKET_DIR}")
+    if [[ "$SSL_ENABLED" == true ]]; then
+        settings+=(-c ssl=on)
+    fi
+
     POSTGRES_LAUNCHED_AT="$(date +%s)"
-    postgres -c "port=${SERVER_PORT}" -c "listen_addresses=*" -c "unix_socket_directories=${SOCKET_DIR}" &
+    postgres "${settings[@]}" &
     POSTGRES_PID=$!
 
     local waited=0
@@ -178,6 +208,7 @@ cd /home/container
 check_settings
 provide_user_entry
 prepare_data
+prepare_certificate
 trap stop_server INT TERM
 start_server
 sync_settings

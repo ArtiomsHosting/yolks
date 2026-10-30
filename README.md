@@ -83,6 +83,12 @@ PostgreSQL 17 and newer, which keeps text sorting stable across OS updates; libc
 over the network need the password (`scram-sha-256`); connections over the local socket in `/tmp` are trusted,
 since only the container itself can reach it.
 
+**SSL:** when `postgres_db` has neither `server.crt` nor `server.key`, a self-signed certificate (RSA 2048, valid
+10 years, named after the container's hostname, which Wings sets to the server's UUID) is created, so existing
+servers get one on their next start. SSL is on but not required: `sslmode=require` encrypts, `sslmode=disable`
+still connects in plain text, and `verify-full` needs a certificate the client trusts. Replace both files with
+your own to use a real certificate; with only one of them present, PostgreSQL starts without SSL.
+
 **Every start:** PostgreSQL listens on the server's port on all addresses (given on the command line, so
 `postgresql.conf` stays the user's to edit). Once it accepts connections, the password is applied, the
 database is created if needed, `[System] Database ready` is printed (the eggs' `done` marker), and the console
