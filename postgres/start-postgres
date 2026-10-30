@@ -1,0 +1,185 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly READY_MESSAGE='[System] Database ready'
+readonly SOCKET_DIR=/tmp
+readonly READY_TIMEOUT_SECONDS=60
+readonly PID_FILE_STARTED_LINE=2
+readonly PID_FILE_STATUS_LINE=7
+readonly IDENTIFIER_PATTERN='^[a-z_][a-z0-9_]{0,62}$'
+
+POSTGRES_PID=''
+POSTGRES_LAUNCHED_AT=0
+CONSOLE_PID=''
+
+log() {
+    printf '\033[1m\033[36m[System]\033[0m %s\n' "$1"
+}
+
+fail() {
+    printf '\033[1m\033[31m[System]\033[0m %s\n' "$1"
+    exit 1
+}
+
+check_settings() {
+    : "${POSTGRES_USER:=postgres}"
+    : "${POSTGRES_DB:=postgres}"
+    : "${SERVER_PORT:=5432}"
+
+    [[ "$POSTGRES_USER" =~ $IDENTIFIER_PATTERN ]] || fail "The user name ${POSTGRES_USER} may only use lowercase letters, numbers and underscores"
+    [[ "$POSTGRES_DB" =~ $IDENTIFIER_PATTERN ]] || fail "The database name ${POSTGRES_DB} may only use lowercase letters, numbers and underscores"
+    [[ -n "${POSTGRES_PASSWORD:-}" ]] || fail 'Set a password for the database user'
+}
+
+provide_user_entry() {
+    if id -un >/dev/null 2>&1; then
+        return
+    fi
+
+    local passwd_file group_file
+    passwd_file="$(mktemp)"
+    group_file="$(mktemp)"
+    cat /etc/passwd > "$passwd_file"
+    cat /etc/group > "$group_file"
+    printf 'container:x:%s:%s:container:%s:/bin/bash\n' "$(id -u)" "$(id -g)" "$HOME" >> "$passwd_file"
+    printf 'container:x:%s:\n' "$(id -g)" >> "$group_file"
+
+    NSS_WRAPPER_PASSWD="$passwd_file"
+    NSS_WRAPPER_GROUP="$group_file"
+    LD_PRELOAD="/usr/lib/$(uname -m)-linux-gnu/libnss_wrapper.so"
+    export NSS_WRAPPER_PASSWD NSS_WRAPPER_GROUP LD_PRELOAD
+}
+
+locale_options() {
+    if (( PG_MAJOR >= 17 )); then
+        printf '%s\n' --locale-provider=builtin --locale=C.UTF-8
+    else
+        printf '%s\n' --locale=C.UTF-8
+    fi
+}
+
+initialize_data() {
+    log "Creating a new PostgreSQL ${PG_MAJOR} database in ${PGDATA}"
+
+    local -a options
+    mapfile -t options < <(locale_options)
+
+    initdb --username="$POSTGRES_USER" --pwfile=<(printf '%s\n' "$POSTGRES_PASSWORD") \
+        --encoding=UTF8 "${options[@]}" \
+        --auth-local=trust --auth-host=scram-sha-256 >/dev/null \
+        || fail 'Creating the database failed'
+
+    printf '\nhost    all    all    all    scram-sha-256\n' >> "${PGDATA}/pg_hba.conf"
+}
+
+check_data_version() {
+    local data_major
+    data_major="$(cat "${PGDATA}/PG_VERSION")"
+
+    if [[ "$data_major" != "$PG_MAJOR" ]]; then
+        fail "The data in ${PGDATA} is from PostgreSQL ${data_major} but this image runs PostgreSQL ${PG_MAJOR}. Switch back to the PostgreSQL ${data_major} image, export the data with pg_dumpall, then import it into a new server."
+    fi
+}
+
+prepare_data() {
+    if [[ -f "${PGDATA}/PG_VERSION" ]]; then
+        check_data_version
+        return
+    fi
+
+    if [[ -d "$PGDATA" && -n "$(ls -A "$PGDATA")" ]]; then
+        fail "${PGDATA} has files but no database. Move them away so a new database can be created."
+    fi
+
+    initialize_data
+}
+
+is_accepting_connections() {
+    local -a lines
+    mapfile -t lines < "${PGDATA}/postmaster.pid" 2>/dev/null || return 1
+
+    [[ "${lines[0]:-}" == "$POSTGRES_PID" ]] \
+        && (( ${lines[PID_FILE_STARTED_LINE]:-0} >= POSTGRES_LAUNCHED_AT )) \
+        && [[ "${lines[PID_FILE_STATUS_LINE]:-}" == ready* ]]
+}
+
+start_server() {
+    POSTGRES_LAUNCHED_AT="$(date +%s)"
+    postgres -c "port=${SERVER_PORT}" -c "listen_addresses=*" -c "unix_socket_directories=${SOCKET_DIR}" &
+    POSTGRES_PID=$!
+
+    local waited=0
+    until is_accepting_connections; do
+        kill -0 "$POSTGRES_PID" 2>/dev/null || fail 'PostgreSQL stopped while starting, see the log above'
+        (( waited < READY_TIMEOUT_SECONDS )) || fail "PostgreSQL did not start within ${READY_TIMEOUT_SECONDS} seconds"
+        sleep 1
+        waited=$(( waited + 1 ))
+    done
+}
+
+local_psql() {
+    PGPASSWORD="$POSTGRES_PASSWORD" psql --no-psqlrc --quiet --host="$SOCKET_DIR" --port="$SERVER_PORT" \
+        --username="$POSTGRES_USER" "$@"
+}
+
+sync_settings() {
+    local_psql --dbname=postgres --set=ON_ERROR_STOP=1 \
+        --set=user="$POSTGRES_USER" --set=password="$POSTGRES_PASSWORD" --set=database="$POSTGRES_DB" <<'SQL' \
+        || log "Could not apply the password and database settings. If you renamed the user, rename it back or run ALTER ROLE yourself."
+ALTER ROLE :"user" WITH PASSWORD :'password';
+SELECT format('CREATE DATABASE %I', :'database')
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = :'database') \gexec
+SQL
+}
+
+stop_server() {
+    trap - INT TERM
+    log 'Stopping PostgreSQL'
+
+    if [[ -n "$CONSOLE_PID" ]]; then
+        kill "$CONSOLE_PID" 2>/dev/null || true
+    fi
+    kill -INT "$POSTGRES_PID" 2>/dev/null || true
+
+    local status=0
+    wait "$POSTGRES_PID" || status=$?
+    exit "$status"
+}
+
+run_console() {
+    local status
+
+    while kill -0 "$POSTGRES_PID" 2>/dev/null; do
+        local_psql --dbname="$POSTGRES_DB" --pset=pager=off <&0 &
+        CONSOLE_PID=$!
+
+        status=0
+        wait -n "$POSTGRES_PID" "$CONSOLE_PID" || status=$?
+
+        if ! kill -0 "$POSTGRES_PID" 2>/dev/null; then
+            kill "$CONSOLE_PID" 2>/dev/null || true
+            exit "$status"
+        fi
+
+        CONSOLE_PID=''
+        if (( status != 0 )); then
+            log 'The SQL console closed with an error. PostgreSQL is still running.'
+            break
+        fi
+        log 'SQL console closed, opening a new one. Stop the server to shut PostgreSQL down.'
+    done
+
+    status=0
+    wait "$POSTGRES_PID" || status=$?
+    exit "$status"
+}
+
+cd /home/container
+check_settings
+provide_user_entry
+prepare_data
+trap stop_server INT TERM
+start_server
+sync_settings
+printf '%s\n' "$READY_MESSAGE"
+run_console

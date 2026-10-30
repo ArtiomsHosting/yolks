@@ -10,6 +10,9 @@ run scripts and apps. Each image is built for `linux/amd64` and `linux/arm64` an
 | `ghcr.io/artiomshosting/yolks:nodejs_24` | `node:24-trixie-slim` | The same, with Node.js 24 |
 | `ghcr.io/artiomshosting/yolks:nodejs_22` | `node:22-trixie-slim` | The same, with Node.js 22 (end of life April 2027) |
 | `ghcr.io/artiomshosting/yolks:nodejs_20` | `node:20-trixie-slim` | The same, with Node.js 20. **End of life since April 2026: Node.js gets no security fixes.** Only for projects that cannot move yet. No TypeScript support |
+| `ghcr.io/artiomshosting/yolks:postgres_18` | `postgres:18-trixie` | PostgreSQL 18 with pgvector, psql, tini |
+| `ghcr.io/artiomshosting/yolks:postgres_17` | `postgres:17-trixie` | The same, with PostgreSQL 17 |
+| `ghcr.io/artiomshosting/yolks:postgres_16` | `postgres:16-trixie` | The same, with PostgreSQL 16 |
 | `ghcr.io/artiomshosting/yolks:installer_debian` | `debian:trixie-slim` | For egg install scripts: runs as root with git, curl, jq, tar, unzip, xz |
 
 Every image also gets a dated tag (`nodejs_26-20261028`) so a server can be pinned to a known build.
@@ -63,6 +66,35 @@ A key defined in the project's `.env` file is left unset so the project's own `.
 
 Right before the app starts it prints `[System] App starting`, which eggs use as their `done` marker.
 
+## `start-postgres` (PostgreSQL images)
+
+All PostgreSQL images build from one `postgres/Dockerfile` with `PG_MAJOR` as a build argument, on the
+official Debian images, and add pgvector from the PostgreSQL apt repository. An egg's startup command is
+just `start-postgres`. It reads these variables:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `POSTGRES_USER` | `postgres` | Superuser created with the database |
+| `POSTGRES_PASSWORD` | none, required | Its password, applied again on every start so changing it in the panel works |
+| `POSTGRES_DB` | `postgres` | Database the console opens, created on start when missing |
+
+**First start:** creates the database in `/home/container/postgres_db` (UTF-8; the `builtin` C.UTF-8 locale on
+PostgreSQL 17 and newer, which keeps text sorting stable across OS updates; libc C.UTF-8 on 16). Connections
+over the network need the password (`scram-sha-256`); connections over the local socket in `/tmp` are trusted,
+since only the container itself can reach it.
+
+**Every start:** PostgreSQL listens on the server's port on all addresses (given on the command line, so
+`postgresql.conf` stays the user's to edit). Once it accepts connections, the password is applied, the
+database is created if needed, `[System] Database ready` is printed (the eggs' `done` marker), and the console
+becomes a `psql` session as that user. Leaving psql with `\q` opens a new one; stopping the server shuts
+PostgreSQL down with a fast shutdown.
+
+**Major versions:** data created by one major version can't be opened by another. Starting with a different
+image stops with a message instead of touching the data; move between versions with `pg_dumpall` and a restore.
+
+Wings runs the server as a user that isn't in `/etc/passwd` unless `system.passwd.enabled` is on, and
+PostgreSQL refuses to run without one, so `start-postgres` provides it through `nss_wrapper` when needed.
+
 ## Building
 
 Images are built by GitHub Actions on every change to their folder, every Monday (without cache, so
@@ -70,6 +102,7 @@ base-image security fixes land) and on demand. To build one locally:
 
 ```sh
 docker buildx build --platform linux/arm64 --build-arg NODE_VERSION=26 -f nodejs/Dockerfile -t yolks:nodejs_26 nodejs
+docker buildx build --platform linux/arm64 --build-arg PG_MAJOR=18 -f postgres/Dockerfile -t yolks:postgres_18 postgres
 ```
 
 ## Credits
