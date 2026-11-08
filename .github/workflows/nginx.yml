@@ -14,13 +14,18 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE: ghcr.io/artiomshosting/yolks
+
 jobs:
   build:
-    name: yolks:nginx_${{ matrix.variant }}
-    runs-on: ubuntu-latest
+    name: yolks:nginx_${{ matrix.variant }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
+        variant: [static, php8.5, php8.4, php8.3]
+        arch: [amd64, arm64]
         include:
           - variant: static
             file: Dockerfile
@@ -34,10 +39,62 @@ jobs:
           - variant: php8.3
             file: php.Dockerfile
             php: "8.3"
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./nginx
+          file: ./nginx/${{ matrix.file }}
+          build-args: PHP_VERSION=${{ matrix.php }}
+          platforms: linux/${{ matrix.arch }}
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-from: type=gha,scope=nginx_${{ matrix.variant }}_${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=nginx_${{ matrix.variant }}_${{ matrix.arch }}
+          provenance: mode=max
+          sbom: true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.variant }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: yolks:nginx_${{ matrix.variant }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [static, php8.5, php8.4, php8.3]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-${{ matrix.variant }}-*
+          merge-multiple: true
 
       - uses: docker/setup-buildx-action@v3
 
@@ -50,19 +107,11 @@ jobs:
       - id: date
         run: echo "today=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: ./nginx
-          file: ./nginx/${{ matrix.file }}
-          build-args: PHP_VERSION=${{ matrix.php }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          pull: true
-          no-cache: ${{ github.event_name == 'schedule' }}
-          cache-from: type=gha,scope=nginx_${{ matrix.variant }}
-          cache-to: type=gha,mode=max,scope=nginx_${{ matrix.variant }}
-          provenance: mode=max
-          sbom: true
-          tags: |
-            ghcr.io/artiomshosting/yolks:nginx_${{ matrix.variant }}
-            ghcr.io/artiomshosting/yolks:nginx_${{ matrix.variant }}-${{ steps.date.outputs.today }}
+      - working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:nginx_${{ matrix.variant }}" \
+            --tag "${IMAGE}:nginx_${{ matrix.variant }}-${{ steps.date.outputs.today }}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - run: docker buildx imagetools inspect "${IMAGE}:nginx_${{ matrix.variant }}"
