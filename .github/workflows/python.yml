@@ -1,0 +1,56 @@
+name: python
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - python/**
+      - .github/workflows/python.yml
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: yolks:python_${{ matrix.version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: date
+        run: echo "today=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./python
+          file: ./python/Dockerfile
+          build-args: PYTHON_VERSION=${{ matrix.version }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          no-cache: ${{ github.event_name == 'schedule' }}
+          cache-from: type=gha,scope=python_${{ matrix.version }}
+          cache-to: type=gha,mode=max,scope=python_${{ matrix.version }}
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ghcr.io/artiomshosting/yolks:python_${{ matrix.version }}
+            ghcr.io/artiomshosting/yolks:python_${{ matrix.version }}-${{ steps.date.outputs.today }}

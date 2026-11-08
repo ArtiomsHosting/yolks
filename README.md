@@ -10,6 +10,12 @@ run scripts and apps. Each image is built for `linux/amd64` and `linux/arm64` an
 | `ghcr.io/artiomshosting/yolks:nodejs_24` | `node:24-trixie-slim` | The same, with Node.js 24 |
 | `ghcr.io/artiomshosting/yolks:nodejs_22` | `node:22-trixie-slim` | The same, with Node.js 22 (end of life April 2027) |
 | `ghcr.io/artiomshosting/yolks:nodejs_20` | `node:20-trixie-slim` | The same, with Node.js 20. **End of life since April 2026: Node.js gets no security fixes.** Only for projects that cannot move yet. No TypeScript support |
+| `ghcr.io/artiomshosting/yolks:python_3.15` | `python:3.15-slim-trixie` | Python 3.15, uv, pip in the virtual environment, git, curl, tini, gcc/g++/make for packages without wheels |
+| `ghcr.io/artiomshosting/yolks:python_3.14` | `python:3.14-slim-trixie` | The same, with Python 3.14 |
+| `ghcr.io/artiomshosting/yolks:python_3.13` | `python:3.13-slim-trixie` | The same, with Python 3.13 |
+| `ghcr.io/artiomshosting/yolks:python_3.12` | `python:3.12-slim-trixie` | The same, with Python 3.12 |
+| `ghcr.io/artiomshosting/yolks:python_3.11` | `python:3.11-slim-trixie` | The same, with Python 3.11 |
+| `ghcr.io/artiomshosting/yolks:python_3.10` | `python:3.10-slim-trixie` | The same, with Python 3.10. **End of life since October 2026: Python gets no security fixes.** Only for projects that cannot move yet |
 | `ghcr.io/artiomshosting/yolks:postgres_18` | `postgres:18-trixie` | PostgreSQL 18 with pgvector, psql, tini |
 | `ghcr.io/artiomshosting/yolks:postgres_17` | `postgres:17-trixie` | The same, with PostgreSQL 17 |
 | `ghcr.io/artiomshosting/yolks:postgres_16` | `postgres:16-trixie` | The same, with PostgreSQL 16 |
@@ -66,6 +72,34 @@ A key defined in the project's `.env` file is left unset so the project's own `.
 
 Right before the app starts it prints `[System] App starting`, which eggs use as their `done` marker.
 
+## `start-app` (Python images)
+
+All Python images build from one `python/Dockerfile` with `PYTHON_VERSION` as a build argument. The root
+filesystem is read-only, so dependencies go into a virtual environment at `/home/container/.venv`, which is
+first on `PATH`: `python` and `pip` in a start command use it (projects with a `uv.lock` get an exact
+environment without pip; use `uv pip` there). Output is unbuffered (`PYTHONUNBUFFERED=1`),
+so `print` shows in the console right away. The egg's startup command is just `start-app`, which reads:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `AUTO_UPDATE`, `GIT_USERNAME`, `GIT_TOKEN` | `0`, empty | The same as in the Node.js images |
+| `INSTALL_DEPS` | `1` | `1` installs dependencies, skipped when nothing changed since the last install |
+| `MAIN_FILE` | empty | File started with `python`; empty = `main.py`, then `app.py`, then `bot.py` |
+| `PYTHON_ARGS` | empty | Extra arguments for `python` |
+| `START_COMMAND` | empty | Replaces the start with a custom command, such as `uvicorn app:app --host 0.0.0.0 --port $PORT` |
+
+**Dependencies** are installed with [uv](https://docs.astral.sh/uv/) from the first of: `uv.lock` (`uv sync
+--frozen --no-dev`), `requirements.txt` (`uv pip install`), or `pyproject.toml` with a `[project]` table (its
+dependencies). A hash of that file and the Python version is stored in `.venv/.dependencies-hash`; the
+install is skipped when it matches. When the server switches to another Python version, `.venv` is
+recreated. uv keeps no cache, so it doesn't use the server's disk twice.
+
+**Environment:** `PORT` (the server's port) and `HOST=0.0.0.0` are set as defaults, unless the project's `.env`
+defines them, since `python-dotenv` does not override variables that are already set.
+
+Right before the app starts it prints `[System] App starting`. Stopping sends SIGINT, which Python raises as
+`KeyboardInterrupt`, so apps can shut down cleanly.
+
 ## `start-postgres` (PostgreSQL images)
 
 All PostgreSQL images build from one `postgres/Dockerfile` with `PG_MAJOR` as a build argument, on the
@@ -108,6 +142,7 @@ base-image security fixes land) and on demand. To build one locally:
 
 ```sh
 docker buildx build --platform linux/arm64 --build-arg NODE_VERSION=26 -f nodejs/Dockerfile -t yolks:nodejs_26 nodejs
+docker buildx build --platform linux/arm64 --build-arg PYTHON_VERSION=3.14 -f python/Dockerfile -t yolks:python_3.14 python
 docker buildx build --platform linux/arm64 --build-arg PG_MAJOR=18 -f postgres/Dockerfile -t yolks:postgres_18 postgres
 ```
 
