@@ -36,7 +36,6 @@ RUN --mount=type=bind,from=extension-installer,source=/usr/bin/install-php-exten
         bcmath \
         exif \
         gd \
-        imagick \
         intl \
         mysqli \
         opcache \
@@ -46,6 +45,7 @@ RUN --mount=type=bind,from=extension-installer,source=/usr/bin/install-php-exten
         pgsql \
         redis \
         zip \
+    && IPE_PROCESSOR_COUNT=1 install-php-extensions imagick \
     && cp "${PHP_INI_DIR}/php.ini-production" "${PHP_INI_DIR}/php.ini"
 
 COPY --from=composer /usr/bin/composer /usr/local/bin/composer
