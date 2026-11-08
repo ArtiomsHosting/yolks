@@ -1,0 +1,350 @@
+#!/bin/bash
+set -euo pipefail
+
+readonly READY_MESSAGE='[System] Web server ready'
+readonly WEB_ROOT=/home/container/www
+readonly SITE_CONFIG_DIR=/home/container/nginx
+readonly PHP_CONFIG_DIR=/home/container/php
+readonly DEFAULTS_DIR=/usr/local/share/start-nginx
+readonly NGINX_RUNTIME_DIR=/tmp/nginx
+readonly NGINX_PID_FILE="${NGINX_RUNTIME_DIR}/nginx.pid"
+readonly SERVER_PORT_CONFIG="${NGINX_RUNTIME_DIR}/server-port.conf"
+readonly NGINX_MAX_WORKERS=4
+readonly PHP_RUNTIME_DIR=/tmp/php
+readonly PHP_SOCKET="${PHP_RUNTIME_DIR}/php-fpm.sock"
+readonly PHP_FPM_CONFIG="${PHP_RUNTIME_DIR}/php-fpm.conf"
+readonly PHP_WORKER_MEMORY_MB=64
+readonly PHP_MIN_WORKERS=2
+readonly PHP_MAX_WORKERS=32
+readonly PHP_WORKER_IDLE_TIMEOUT=10s
+readonly PHP_WORKER_MAX_REQUESTS=500
+readonly PHP_LOG_LIMIT_BYTES=8192
+readonly DEPENDENCY_STAMP="${WEB_ROOT}/vendor/.dependencies-hash"
+readonly READY_TIMEOUT_SECONDS=30
+readonly READY_POLL_SECONDS=0.1
+readonly CPU_LIMIT_FILE=/sys/fs/cgroup/cpu.max
+
+NGINX_PID=''
+PHP_FPM_PID=''
+CONSOLE_PID=''
+
+log() {
+    printf '\033[1m\033[36m[System]\033[0m %s\n' "$1"
+}
+
+fail() {
+    printf '\033[1m\033[31m[System]\033[0m %s\n' "$1"
+    exit 1
+}
+
+is_enabled() {
+    [[ "${1:-0}" == "1" || "${1:-}" == "true" ]]
+}
+
+has_php() {
+    command -v php-fpm >/dev/null 2>&1
+}
+
+git_with_credentials() {
+    if [[ -z "${GIT_TOKEN:-}" ]]; then
+        git "$@"
+        return
+    fi
+
+    git -c credential.helper= \
+        -c credential.helper='!f() { echo "username=${GIT_USERNAME:-x-access-token}"; echo "password=${GIT_TOKEN}"; }; f' \
+        "$@"
+}
+
+check_settings() {
+    [[ "${SERVER_PORT:-}" =~ ^[0-9]+$ ]] || fail 'SERVER_PORT is not set. Start the server from the panel.'
+}
+
+update_repository() {
+    if ! is_enabled "${AUTO_UPDATE:-0}" || [[ ! -d "${WEB_ROOT}/.git" ]]; then
+        return
+    fi
+
+    log 'Pulling the latest changes into www'
+    if ! git_with_credentials -C "$WEB_ROOT" pull --ff-only; then
+        log 'Could not pull the latest changes, starting with the current files'
+    fi
+}
+
+has_files_matching() {
+    compgen -G "$1" >/dev/null
+}
+
+prepare_files() {
+    mkdir -p "$WEB_ROOT" "$SITE_CONFIG_DIR"
+
+    if ! has_files_matching "${SITE_CONFIG_DIR}/*.conf"; then
+        cp "${DEFAULTS_DIR}/default.conf" "${SITE_CONFIG_DIR}/default.conf"
+        log 'Created nginx/default.conf with the site settings'
+    fi
+
+    if has_php; then
+        mkdir -p "$PHP_CONFIG_DIR"
+        if ! has_files_matching "${PHP_CONFIG_DIR}/*.ini"; then
+            cp "${DEFAULTS_DIR}/php.ini" "${PHP_CONFIG_DIR}/php.ini"
+            log 'Created php/php.ini with the PHP settings'
+        fi
+    fi
+
+    if [[ -z "$(ls -A "$WEB_ROOT")" ]]; then
+        log "www is empty. Upload your site's files to www."
+    fi
+}
+
+php_version() {
+    php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;'
+}
+
+dependencies_hash() {
+    {
+        printf 'php %s\n' "$(php_version)"
+        cat "${WEB_ROOT}/composer.json"
+        if [[ -f "${WEB_ROOT}/composer.lock" ]]; then
+            cat "${WEB_ROOT}/composer.lock"
+        fi
+    } | sha256sum | cut -d ' ' -f 1
+}
+
+install_dependencies() {
+    if ! has_php || ! is_enabled "${INSTALL_DEPS:-1}" || [[ ! -f "${WEB_ROOT}/composer.json" ]]; then
+        return
+    fi
+
+    if [[ -f "$DEPENDENCY_STAMP" && "$(cat "$DEPENDENCY_STAMP")" == "$(dependencies_hash)" ]]; then
+        log 'Composer dependencies are up to date, delete www/vendor to force a clean install'
+        return
+    fi
+
+    log 'Installing Composer dependencies'
+    composer install --working-dir="$WEB_ROOT" --no-dev --no-interaction --no-progress --optimize-autoloader --no-cache \
+        || fail 'Installing Composer dependencies failed'
+
+    if [[ -d "$(dirname "$DEPENDENCY_STAMP")" ]]; then
+        dependencies_hash > "$DEPENDENCY_STAMP"
+    fi
+}
+
+cpu_limit() {
+    [[ -r "$CPU_LIMIT_FILE" ]] || return 1
+
+    local quota period
+    read -r quota period < "$CPU_LIMIT_FILE"
+    [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] || return 1
+
+    printf '%s\n' $(( (quota + period - 1) / period ))
+}
+
+nginx_workers() {
+    local workers
+    workers="$(cpu_limit || nproc)"
+    (( workers <= NGINX_MAX_WORKERS )) || workers="$NGINX_MAX_WORKERS"
+    printf '%s\n' "$workers"
+}
+
+php_workers() {
+    local memory="${SERVER_MEMORY:-0}"
+    if [[ ! "$memory" =~ ^[0-9]+$ ]] || (( memory == 0 )); then
+        printf '%s\n' "$PHP_MAX_WORKERS"
+        return
+    fi
+
+    local workers=$(( memory / PHP_WORKER_MEMORY_MB ))
+    (( workers >= PHP_MIN_WORKERS )) || workers="$PHP_MIN_WORKERS"
+    (( workers <= PHP_MAX_WORKERS )) || workers="$PHP_MAX_WORKERS"
+    printf '%s\n' "$workers"
+}
+
+write_php_fpm_config() {
+    mkdir -p "$PHP_RUNTIME_DIR"
+    cat > "$PHP_FPM_CONFIG" <<EOF
+[global]
+error_log = /proc/self/fd/2
+log_level = warning
+log_limit = ${PHP_LOG_LIMIT_BYTES}
+daemonize = no
+
+[www]
+listen = ${PHP_SOCKET}
+pm = ondemand
+pm.max_children = $(php_workers)
+pm.process_idle_timeout = ${PHP_WORKER_IDLE_TIMEOUT}
+pm.max_requests = ${PHP_WORKER_MAX_REQUESTS}
+catch_workers_output = yes
+decorate_workers_output = no
+EOF
+}
+
+write_runtime_files() {
+    mkdir -p "$NGINX_RUNTIME_DIR"
+    printf 'listen %s;\n' "$SERVER_PORT" > "$SERVER_PORT_CONFIG"
+
+    if has_php; then
+        write_php_fpm_config
+    fi
+}
+
+wait_until_ready() {
+    local name="$1" pid="$2" check="$3"
+    local deadline=$(( SECONDS + READY_TIMEOUT_SECONDS ))
+
+    until "$check"; do
+        kill -0 "$pid" 2>/dev/null || fail "${name} stopped while starting, see the error above"
+        (( SECONDS < deadline )) || fail "${name} did not start within ${READY_TIMEOUT_SECONDS} seconds"
+        sleep "$READY_POLL_SECONDS"
+    done
+}
+
+php_fpm_ready() {
+    [[ -S "$PHP_SOCKET" ]]
+}
+
+nginx_ready() {
+    [[ -s "$NGINX_PID_FILE" && "$(cat "$NGINX_PID_FILE")" == "$NGINX_PID" ]]
+}
+
+start_php_fpm() {
+    php-fpm --nodaemonize --fpm-config "$PHP_FPM_CONFIG" &
+    PHP_FPM_PID=$!
+    wait_until_ready 'PHP-FPM' "$PHP_FPM_PID" php_fpm_ready
+}
+
+start_nginx() {
+    nginx -e stderr -g "daemon off; worker_processes $(nginx_workers);" &
+    NGINX_PID=$!
+    wait_until_ready 'Nginx' "$NGINX_PID" nginx_ready
+}
+
+check_port() {
+    if ! ss -Hltn "sport = :${SERVER_PORT}" | grep -q .; then
+        log "Nginx is not listening on port ${SERVER_PORT}, the server's port, so the site can't be reached. Add include server-port.conf; to a server block in nginx/."
+    fi
+}
+
+test_config() {
+    local status=0
+    nginx -e stderr -t -q || status=1
+
+    if has_php; then
+        local output problems
+        output="$(php-fpm -t --fpm-config "$PHP_FPM_CONFIG" 2>&1)" || status=1
+        problems="$(grep -v 'test is successful' <<< "$output" || true)"
+        if [[ -n "$problems" ]]; then
+            printf '%s\n' "$problems"
+            status=1
+        fi
+    fi
+
+    return "$status"
+}
+
+reload_config() {
+    if ! test_config; then
+        log 'The configuration has errors, nothing was reloaded'
+        return
+    fi
+
+    kill -HUP "$NGINX_PID"
+    if [[ -n "$PHP_FPM_PID" ]]; then
+        kill -USR2 "$PHP_FPM_PID"
+    fi
+    log 'Reloaded the configuration'
+}
+
+show_help() {
+    log 'Console commands: reload applies changes to the configuration without a restart, test checks the configuration for errors'
+}
+
+run_console() {
+    local command
+    while read -r command _; do
+        case "${command,,}" in
+            '') ;;
+            reload) reload_config ;;
+            test)
+                if test_config; then
+                    log 'The configuration is valid'
+                else
+                    log 'The configuration has errors'
+                fi
+                ;;
+            help) show_help ;;
+            *) log "Unknown command ${command}. Type help for the list of commands." ;;
+        esac
+    done
+}
+
+stop_processes() {
+    local pid
+    for pid in "$CONSOLE_PID" "$NGINX_PID" "$PHP_FPM_PID"; do
+        if [[ -n "$pid" ]]; then
+            kill -TERM "$pid" 2>/dev/null || true
+        fi
+    done
+}
+
+stop_server() {
+    trap - INT TERM
+    log 'Stopping the web server'
+    stop_processes
+
+    local status=0
+    if [[ -n "$NGINX_PID" ]]; then
+        wait "$NGINX_PID" || status=$?
+    fi
+    wait || true
+    exit "$status"
+}
+
+stopped_server_name() {
+    if [[ -n "$PHP_FPM_PID" ]] && ! kill -0 "$PHP_FPM_PID" 2>/dev/null; then
+        printf 'PHP-FPM\n'
+    else
+        printf 'Nginx\n'
+    fi
+}
+
+supervise() {
+    run_console <&0 &
+    CONSOLE_PID=$!
+
+    local -a servers=("$NGINX_PID")
+    if [[ -n "$PHP_FPM_PID" ]]; then
+        servers+=("$PHP_FPM_PID")
+    fi
+
+    local status=0
+    wait -n "${servers[@]}" "$CONSOLE_PID" || status=$?
+
+    if ! kill -0 "$CONSOLE_PID" 2>/dev/null; then
+        CONSOLE_PID=''
+        status=0
+        wait -n "${servers[@]}" || status=$?
+    fi
+
+    trap - INT TERM
+    log "$(stopped_server_name) stopped unexpectedly, stopping the web server"
+    stop_processes
+    wait || true
+    (( status != 0 )) || status=1
+    exit "$status"
+}
+
+cd /home/container
+check_settings
+update_repository
+prepare_files
+install_dependencies
+write_runtime_files
+trap stop_server INT TERM
+if has_php; then
+    start_php_fpm
+fi
+start_nginx
+check_port
+printf '%s\n' "$READY_MESSAGE"
+supervise

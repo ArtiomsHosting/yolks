@@ -19,6 +19,10 @@ run scripts and apps. Each image is built for `linux/amd64` and `linux/arm64` an
 | `ghcr.io/artiomshosting/yolks:postgres_18` | `postgres:18-trixie` | PostgreSQL 18 with pgvector, psql, tini |
 | `ghcr.io/artiomshosting/yolks:postgres_17` | `postgres:17-trixie` | The same, with PostgreSQL 17 |
 | `ghcr.io/artiomshosting/yolks:postgres_16` | `postgres:16-trixie` | The same, with PostgreSQL 16 |
+| `ghcr.io/artiomshosting/yolks:nginx_static` | `nginx:stable-trixie` | Nginx stable, git, tini |
+| `ghcr.io/artiomshosting/yolks:nginx_php8.5` | `php:8.5-fpm-trixie` | Nginx stable from nginx.org, PHP 8.5 FPM, Composer, common PHP extensions, git, tini |
+| `ghcr.io/artiomshosting/yolks:nginx_php8.4` | `php:8.4-fpm-trixie` | The same, with PHP 8.4 |
+| `ghcr.io/artiomshosting/yolks:nginx_php8.3` | `php:8.3-fpm-trixie` | The same, with PHP 8.3 |
 | `ghcr.io/artiomshosting/yolks:installer_debian` | `debian:trixie-slim` | For egg install scripts: runs as root with git, curl, jq, tar, unzip, xz |
 
 Every image also gets a dated tag (`nodejs_26-20261028`) so a server can be pinned to a known build.
@@ -135,6 +139,56 @@ image stops with a message instead of touching the data; move between versions w
 Wings runs the server as a user that isn't in `/etc/passwd` unless `system.passwd.enabled` is on, and
 PostgreSQL refuses to run without one, so `start-postgres` provides it through `nss_wrapper` when needed.
 
+## `start-nginx` (Nginx images)
+
+`nginx/Dockerfile` builds the static image on the official Nginx image. `nginx/php.Dockerfile` builds the PHP
+images on the official PHP-FPM images with `PHP_VERSION` as a build argument, adds Nginx stable from the
+nginx.org apt repository and these extensions on top of PHP's defaults: bcmath, exif, gd, imagick, intl, mysqli,
+opcache, pcntl, pdo_mysql, pdo_pgsql, pgsql, redis, zip. An egg's startup command is just `start-nginx`. It
+reads these variables:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `AUTO_UPDATE` | `0` | `1` pulls the latest commit (fast-forward only) into `www` before starting, when `www` is a git checkout |
+| `GIT_USERNAME`, `GIT_TOKEN` | empty | Credentials for private repositories, passed to git without being written to `.git/config` |
+| `INSTALL_DEPS` | `1` | PHP images: `1` runs `composer install --no-dev` when there is a `www/composer.json`, skipped when nothing changed |
+
+**Files on the server:**
+
+| Path | What it is |
+| --- | --- |
+| `www/` | The web root |
+| `nginx/*.conf` | The site configuration, included in Nginx's `http` block. `default.conf` is created when the folder has no `.conf` file |
+| `php/*.ini` | PHP images: PHP settings, loaded after the image's own. `php.ini` is created when the folder has no `.ini` file |
+
+The image owns the main `nginx.conf` (`nginx/config/nginx.conf`): the pid file and temporary files in `/tmp`,
+logs to the console, gzip, `server_tokens off`, and relative redirects, so redirects keep working behind a
+proxy. Override its `http` settings inside a `server` block. Two files ship with the image for the site
+configuration to include:
+
+- `server-port.conf` is `listen <port>;` with the server's current port, written on every start, so a site
+  keeps working when its port changes. Replace the include with your own `listen` line to add options such
+  as `ssl`.
+- `php.conf` passes `.php` files to PHP-FPM on the PHP images and answers them with 404 on the static image,
+  so switching images never serves PHP source code.
+
+The default site serves `www`, sends unknown paths to `index.php` when it exists (WordPress and Laravel
+style front controllers), shows `404.html` when there is one, hides dotfiles (except `.well-known`),
+`vendor/` and `composer.json`/`composer.lock`, and accepts uploads up to 32 MB (`client_max_body_size`;
+raise `upload_max_filesize` and `post_max_size` in `php/php.ini` with it).
+
+**Every start:** Nginx runs with one worker per CPU of the server's limit (at most 4). PHP-FPM starts first, on
+a socket in `/tmp`, with workers started on demand: one per 64 MB of the server's memory, between 2 and 32.
+PHP scripts don't see the server's environment variables. Once Nginx listens, `[System] Web server ready` is
+printed (the eggs' `done` marker), with a warning when nothing listens on the server's port. Requests and
+errors, PHP warnings included, are shown in the console; add `access_log off;` to a `server` block to hide the
+requests.
+
+**Console:** `reload` checks the Nginx and PHP configuration and applies it without a restart (a broken
+configuration is reported and the running one is kept), `test` only checks it, `help` lists the commands.
+Stopping the server shuts Nginx and PHP-FPM down with a fast shutdown. If either one stops on its own, the
+other is stopped too, so the panel shows the server as crashed.
+
 ## Building
 
 Images are built by GitHub Actions on every change to their folder, every Monday (without cache, so
@@ -144,6 +198,8 @@ base-image security fixes land) and on demand. To build one locally:
 docker buildx build --platform linux/arm64 --build-arg NODE_VERSION=26 -f nodejs/Dockerfile -t yolks:nodejs_26 nodejs
 docker buildx build --platform linux/arm64 --build-arg PYTHON_VERSION=3.14 -f python/Dockerfile -t yolks:python_3.14 python
 docker buildx build --platform linux/arm64 --build-arg PG_MAJOR=18 -f postgres/Dockerfile -t yolks:postgres_18 postgres
+docker buildx build --platform linux/arm64 -f nginx/Dockerfile -t yolks:nginx_static nginx
+docker buildx build --platform linux/arm64 --build-arg PHP_VERSION=8.5 -f nginx/php.Dockerfile -t yolks:nginx_php8.5 nginx
 ```
 
 ## Credits
