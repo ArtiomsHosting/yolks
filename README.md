@@ -143,7 +143,7 @@ PostgreSQL refuses to run without one, so `start-postgres` provides it through `
 
 `nginx/Dockerfile` builds the static image on the official Nginx image. `nginx/php.Dockerfile` builds the PHP
 images on the official PHP-FPM images with `PHP_VERSION` as a build argument, adds Nginx stable from the
-nginx.org apt repository and these extensions on top of PHP's defaults: bcmath, exif, gd, imagick, intl, mysqli,
+nginx.org apt repository and these extensions on top of PHP's defaults: bcmath, exif, gd, intl, mysqli,
 opcache, pcntl, pdo_mysql, pdo_pgsql, pgsql, redis, zip. An egg's startup command is just `start-nginx`. It
 reads these variables:
 
